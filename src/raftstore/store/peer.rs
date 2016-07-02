@@ -353,7 +353,8 @@ impl Peer {
     }
 
     pub fn handle_raft_ready<T: Transport>(&mut self,
-                                           trans: &Arc<RwLock<T>>)
+                                           trans: &Arc<RwLock<T>>,
+                                           wb: &WriteBatch)
                                            -> Result<Option<ReadyResult>> {
         if !self.raft_group.has_ready() {
             return Ok(None);
@@ -381,13 +382,13 @@ impl Peer {
             try!(self.send(trans, &ready.messages));
         }
 
-        let apply_result = try!(self.storage.wl().handle_raft_ready(&ready));
+        let apply_result = try!(self.storage.wl().handle_raft_ready(&ready, wb));
 
         if !self.is_leader() {
             try!(self.send(trans, &ready.messages));
         }
 
-        let exec_results = try!(self.handle_raft_commit_entries(&ready.committed_entries));
+        let exec_results = try!(self.handle_raft_commit_entries(&ready.committed_entries, wb));
 
         slow_log!(t,
                   "handle peer {:?}, region {} ready, entries {}, committed entries {}, messages \
@@ -676,7 +677,8 @@ impl Peer {
     }
 
     fn handle_raft_commit_entries(&mut self,
-                                  committed_entries: &[raftpb::Entry])
+                                  committed_entries: &[raftpb::Entry],
+                                  wb: &WriteBatch)
                                   -> Result<Vec<ExecResult>> {
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
         // others will be saved as a normal entry with no data, so we must re-propose these
@@ -686,8 +688,8 @@ impl Peer {
         let committed_count = committed_entries.len();
         for entry in committed_entries {
             let res = try!(match entry.get_entry_type() {
-                raftpb::EntryType::EntryNormal => self.handle_raft_entry_normal(entry),
-                raftpb::EntryType::EntryConfChange => self.handle_raft_entry_conf_change(entry),
+                raftpb::EntryType::EntryNormal => self.handle_raft_entry_normal(entry, wb),
+                raftpb::EntryType::EntryConfChange => self.handle_raft_entry_conf_change(entry, wb),
             });
 
             if let Some(res) = res {
@@ -703,7 +705,10 @@ impl Peer {
         Ok(results)
     }
 
-    fn handle_raft_entry_normal(&mut self, entry: &raftpb::Entry) -> Result<Option<ExecResult>> {
+    fn handle_raft_entry_normal(&mut self,
+                                entry: &raftpb::Entry,
+                                wb: &WriteBatch)
+                                -> Result<Option<ExecResult>> {
         let index = entry.get_index();
         let term = entry.get_term();
         let data = entry.get_data();
@@ -715,21 +720,22 @@ impl Peer {
 
         let cmd = try!(protobuf::parse_from_bytes::<RaftCmdRequest>(data));
         // no need to return error here.
-        self.process_raft_cmd(index, term, cmd).or_else(|e| {
+        self.process_raft_cmd(index, term, cmd, wb).or_else(|e| {
             error!("process raft command at index {} err: {:?}", index, e);
             Ok(None)
         })
     }
 
     fn handle_raft_entry_conf_change(&mut self,
-                                     entry: &raftpb::Entry)
+                                     entry: &raftpb::Entry,
+                                     wb: &WriteBatch)
                                      -> Result<Option<ExecResult>> {
         let index = entry.get_index();
         let term = entry.get_term();
         let mut conf_change =
             try!(protobuf::parse_from_bytes::<raftpb::ConfChange>(entry.get_data()));
         let cmd = try!(protobuf::parse_from_bytes::<RaftCmdRequest>(conf_change.get_context()));
-        let res = match self.process_raft_cmd(index, term, cmd) {
+        let res = match self.process_raft_cmd(index, term, cmd, wb) {
             a @ Ok(Some(_)) => a,
             e => {
                 error!("process raft command at index {} err: {:?}", index, e);
@@ -771,7 +777,8 @@ impl Peer {
     fn process_raft_cmd(&mut self,
                         index: u64,
                         term: u64,
-                        cmd: RaftCmdRequest)
+                        cmd: RaftCmdRequest,
+                        wb: &WriteBatch)
                         -> Result<Option<ExecResult>> {
         if index == 0 {
             return Err(box_err!("processing raft command needs a none zero index"));
@@ -779,7 +786,7 @@ impl Peer {
 
         let uuid = util::get_uuid_from_req(&cmd).unwrap();
         let cb = self.find_cb(uuid, term, &cmd);
-        let (mut resp, exec_result) = self.apply_raft_cmd(index, &cmd).unwrap_or_else(|e| {
+        let (mut resp, exec_result) = self.apply_raft_cmd(index, &cmd, wb).unwrap_or_else(|e| {
             error!("apply raft command err {:?}", e);
             (cmd_resp::new_error(e), None)
         });
@@ -813,7 +820,8 @@ impl Peer {
 
     fn apply_raft_cmd(&mut self,
                       index: u64,
-                      req: &RaftCmdRequest)
+                      req: &RaftCmdRequest,
+                      wb: &WriteBatch)
                       -> Result<(RaftCmdResponse, Option<ExecResult>)> {
         if self.pending_remove {
             let region_not_found = Error::RegionNotFound(self.region_id);
@@ -835,7 +843,7 @@ impl Peer {
         let mut ctx = ExecContext {
             snap: Snapshot::new(engine),
             // TODO: lock the whole method.
-            invoke_ctx: InvokeContext::new(&self.storage.rl()),
+            invoke_ctx: InvokeContext::new(&self.storage.rl(), wb),
             req: req,
         };
         let (mut resp, exec_result) = self.exec_raft_cmd(&mut ctx).unwrap_or_else(|e| {
@@ -848,27 +856,20 @@ impl Peer {
 
         // Commit write and change storage fields atomically.
         let mut storage = self.storage.wl();
-        match self.engine.write_without_wal(ctx.invoke_ctx.wb) {
-            Ok(_) => {
-                storage.local_state = ctx.invoke_ctx.local_state;
+        storage.local_state = ctx.invoke_ctx.local_state;
 
-                if let Some(ref exec_result) = exec_result {
-                    match *exec_result {
-                        ExecResult::ChangePeer { ref region, .. } => {
-                            storage.region = region.clone();
-                        }
-                        ExecResult::CompactLog { .. } => {}
-                        ExecResult::SplitRegion { ref left, .. } => {
-                            storage.region = left.clone();
-                        }
-                    }
-                };
-            }
-            Err(e) => {
-                error!("commit batch failed err {:?}", e);
-                resp = cmd_resp::message_error(e);
+        if let Some(ref exec_result) = exec_result {
+            match *exec_result {
+                ExecResult::ChangePeer { ref region, .. } => {
+                    storage.region = region.clone();
+                }
+                ExecResult::CompactLog { .. } => {}
+                ExecResult::SplitRegion { ref left, .. } => {
+                    storage.region = left.clone();
+                }
             }
         };
+
 
         Ok((resp, exec_result))
     }
@@ -898,22 +899,22 @@ fn get_change_peer_cmd(msg: &RaftCmdRequest) -> Option<&ChangePeerRequest> {
     Some(req.get_change_peer())
 }
 
-struct ExecContext<'a> {
+struct ExecContext<'a, 'b> {
     pub snap: Snapshot,
-    pub invoke_ctx: InvokeContext,
+    pub invoke_ctx: InvokeContext<'b>,
     pub req: &'a RaftCmdRequest,
 }
 
-impl<'a> Deref for ExecContext<'a> {
-    type Target = InvokeContext;
+impl<'a, 'b> Deref for ExecContext<'a, 'b> {
+    type Target = InvokeContext<'b>;
 
-    fn deref(&self) -> &InvokeContext {
+    fn deref(&self) -> &InvokeContext<'b> {
         &self.invoke_ctx
     }
 }
 
-impl<'a> DerefMut for ExecContext<'a> {
-    fn deref_mut(&mut self) -> &mut InvokeContext {
+impl<'a, 'b> DerefMut for ExecContext<'a, 'b> {
+    fn deref_mut(&mut self) -> &mut InvokeContext<'b> {
         &mut self.invoke_ctx
     }
 }

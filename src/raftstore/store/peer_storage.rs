@@ -85,16 +85,16 @@ pub struct ApplySnapResult {
     pub region: metapb::Region,
 }
 
-pub struct InvokeContext {
+pub struct InvokeContext<'a> {
     pub local_state: RaftLocalState,
-    pub wb: WriteBatch,
+    pub wb: &'a WriteBatch,
 }
 
-impl InvokeContext {
-    pub fn new(store: &PeerStorage) -> InvokeContext {
+impl<'a> InvokeContext<'a> {
+    pub fn new(store: &PeerStorage, wb: &'a WriteBatch) -> InvokeContext<'a> {
         InvokeContext {
             local_state: store.local_state.clone(),
-            wb: WriteBatch::new(),
+            wb: wb,
         }
     }
 
@@ -451,8 +451,11 @@ impl PeerStorage {
         self.region.get_id()
     }
 
-    pub fn handle_raft_ready(&mut self, ready: &Ready) -> Result<Option<ApplySnapResult>> {
-        let mut ctx = InvokeContext::new(self);
+    pub fn handle_raft_ready(&mut self,
+                             ready: &Ready,
+                             wb: &WriteBatch)
+                             -> Result<Option<ApplySnapResult>> {
+        let mut ctx = InvokeContext::new(self, wb);
         let mut apply_snap_res = None;
         let region_id = self.get_region_id();
         if !raft::is_empty_snap(&ready.snapshot) {
@@ -473,10 +476,6 @@ impl PeerStorage {
 
         if ctx.local_state != self.local_state {
             try!(ctx.save(region_id));
-        }
-
-        if !ctx.wb.is_empty() {
-            try!(self.engine.write(ctx.wb));
         }
 
         self.local_state = ctx.local_state;
@@ -689,15 +688,18 @@ mod test {
                              ents: &[Entry])
                              -> RaftStorage {
         let store = new_storage(sched, path);
-        let mut ctx = InvokeContext::new(&store.rl());
-        store.rl().append(&mut ctx, &ents[1..]).expect("");
-        ctx.local_state.mut_truncated_state().set_index(ents[0].get_index());
-        ctx.local_state.mut_truncated_state().set_term(ents[0].get_term());
-        ctx.local_state.set_applied_index(ents.last().unwrap().get_index());
-        ctx.save(store.rl().get_region_id()).unwrap();
-        store.rl().engine.write(ctx.wb).expect("");
+        let mut wb = WriteBatch::new();
+        {
+            let mut ctx = InvokeContext::new(&store.rl(), &wb);
+            store.rl().append(&mut ctx, &ents[1..]).expect("");
+            ctx.local_state.mut_truncated_state().set_index(ents[0].get_index());
+            ctx.local_state.mut_truncated_state().set_term(ents[0].get_term());
+            ctx.local_state.set_applied_index(ents.last().unwrap().get_index());
+            ctx.save(store.rl().get_region_id()).unwrap();
+            store.wl().local_state = ctx.local_state;
+        }
+        store.rl().engine.write(wb).expect("");
 
-        store.wl().local_state = ctx.local_state;
         store
     }
 
@@ -791,14 +793,17 @@ mod test {
             let worker = Worker::new("snap_manager");
             let sched = worker.scheduler();
             let store = new_storage_from_ents(sched, &td, &ents);
-            let mut ctx = InvokeContext::new(&store.rl());
-            let res = store.rl().compact(&mut ctx, idx);
+            let mut wb = WriteBatch::new();
+            let res = {
+                let mut ctx = InvokeContext::new(&store.rl(), &wb);
+                store.rl().compact(&mut ctx, idx)
+            };
             // TODO check exact error type after refactoring error.
             if res.is_err() ^ werr.is_err() {
                 panic!("#{}: want {:?}, got {:?}", i, werr, res);
             }
             if res.is_ok() {
-                store.rl().engine.write(ctx.wb).expect("");
+                store.rl().engine.write(wb).expect("");
             }
         }
     }
@@ -877,10 +882,13 @@ mod test {
             let worker = Worker::new("snap_manager");
             let sched = worker.scheduler();
             let store = new_storage_from_ents(sched, &td, &ents);
-            let mut ctx = InvokeContext::new(&store.rl());
-            store.wl().append(&mut ctx, &entries).expect("");
-            store.wl().engine.write(ctx.wb).expect("");
-            store.wl().local_state = ctx.local_state;
+            let mut wb = WriteBatch::new();
+            {
+                let mut ctx = InvokeContext::new(&store.rl(), &wb);
+                store.wl().append(&mut ctx, &entries).expect("");
+                store.wl().local_state = ctx.local_state;
+            }
+            store.wl().engine.write(wb).expect("");
             let li = store.wl().last_index();
             let actual_entries = store.rl().entries(4, li + 1, u64::max_value()).expect("");
             if actual_entries != wentries {
@@ -923,7 +931,8 @@ mod test {
         let td2 = TempDir::new("tikv-store-test").unwrap();
         let s2 = new_storage(sched, &td2);
         assert_eq!(s2.rl().first_index(), s2.rl().applied_index() + 1);
-        let mut ctx = InvokeContext::new(&s2.rl());
+        let mut wb = WriteBatch::new();
+        let mut ctx = InvokeContext::new(&s2.rl(), &wb);
         s2.wl().apply_snapshot(&mut ctx, &snap1).unwrap();
         assert_eq!(ctx.local_state.get_applied_index(), 5);
         assert_eq!(ctx.local_state.get_last_index(), 5);

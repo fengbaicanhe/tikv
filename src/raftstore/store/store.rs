@@ -19,7 +19,7 @@ use std::collections::Bound::{Excluded, Unbounded};
 use std::time::Duration;
 use std::{cmp, u64};
 
-use rocksdb::DB;
+use rocksdb::{DB, WriteBatch};
 use mio::{self, EventLoop, EventLoopBuilder, Sender};
 use protobuf;
 use uuid::Uuid;
@@ -376,28 +376,32 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let ids: Vec<u64> = self.pending_raft_groups.drain().collect();
         let pending_count = ids.len();
 
-        for region_id in ids {
-            let mut ready_result = None;
-            if let Some(peer) = self.region_peers.get_mut(&region_id) {
-                match peer.handle_raft_ready(&self.trans) {
-                    Err(e) => {
-                        // TODO: should we panic or shutdown the store?
-                        error!("handle raft ready at region {} err: {:?}", region_id, e);
+        let mut wb = WriteBatch::new();
+        {
+            for region_id in ids {
+                let mut ready_result = None;
+                if let Some(peer) = self.region_peers.get_mut(&region_id) {
+                    match peer.handle_raft_ready(&self.trans, &wb) {
+                        Err(e) => {
+                            // TODO: should we panic or shutdown the store?
+                            error!("handle raft ready at region {} err: {:?}", region_id, e);
+                            return Err(e);
+                        }
+                        Ok(ready) => ready_result = ready,
+                    }
+                }
+
+                if let Some(ready_result) = ready_result {
+                    if let Err(e) = self.on_ready_result(region_id, ready_result) {
+                        error!("handle raft ready result at region {} err: {:?}",
+                               region_id,
+                               e);
                         return Err(e);
                     }
-                    Ok(ready) => ready_result = ready,
-                }
-            }
-
-            if let Some(ready_result) = ready_result {
-                if let Err(e) = self.on_ready_result(region_id, ready_result) {
-                    error!("handle raft ready result at region {} err: {:?}",
-                           region_id,
-                           e);
-                    return Err(e);
                 }
             }
         }
+        self.engine.write(wb);
 
         slow_log!(t,
                   "on {} regions raft ready takes {:?}",
